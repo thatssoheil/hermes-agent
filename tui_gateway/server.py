@@ -8878,6 +8878,8 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     if kind == "crashed":
         return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
     if kind == "timed_out":
+        task_status = str(getattr(task, "status", "") or "")
+        retry_suffix = "; will retry" if task_status == "ready" else ""
         # Iteration-budget exhaustion carries budget_used/budget_max, not a
         # wall-clock limit — render it as such and never invent
         # max_runtime=0s (#79399).
@@ -8886,7 +8888,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         if budget_used is not None and budget_max is not None:
             return (
                 f"⏱ {board_tag}{tag}Kanban {task_id} iteration budget exhausted "
-                f"({budget_used}/{budget_max}); will retry"
+                f"({budget_used}/{budget_max}){retry_suffix}"
             )
         limit = None
         try:
@@ -8900,7 +8902,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
             limit = int(task.max_runtime_seconds)
         return (
             f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
-            f"(max_runtime={limit if limit is not None else '?'}s); will retry"
+            f"(max_runtime={limit if limit is not None else '?'}s){retry_suffix}"
         )
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"

@@ -459,6 +459,10 @@ class GatewayKanbanWatchersMixin:
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
+                            task_status = task.status if task else ""
+                            retry_suffix = (
+                                "; will retry" if task_status == "ready" else ""
+                            )
                             limit = None
                             if ev.payload:
                                 # Iteration-budget exhaustion carries the
@@ -471,7 +475,7 @@ class GatewayKanbanWatchersMixin:
                                     msg = (
                                         f"⏱ {board_tag}{tag}Kanban {sub['task_id']} "
                                         f"iteration budget exhausted "
-                                        f"({budget_used}/{budget_max}); will retry"
+                                        f"({budget_used}/{budget_max}){retry_suffix}"
                                     )
                                 else:
                                     if ev.payload.get("limit_seconds"):
@@ -484,12 +488,12 @@ class GatewayKanbanWatchersMixin:
                             if limit is not None:
                                 msg = (
                                     f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                    f"(max_runtime={limit}s); will retry"
+                                    f"(max_runtime={limit}s){retry_suffix}"
                                 )
                             elif "iteration budget" not in msg:
                                 msg = (
                                     f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                    f"(max_runtime=?s); will retry"
+                                    f"(max_runtime=?s){retry_suffix}"
                                 )
                         elif kind == "status":
                             new_status = ""
