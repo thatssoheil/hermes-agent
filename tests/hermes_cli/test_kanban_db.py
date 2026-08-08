@@ -32,12 +32,12 @@ def kanban_home(tmp_path, monkeypatch):
 
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -649,12 +649,16 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     ).stdout.strip()
     ws_common = subprocess.run(
         ["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     ).stdout.strip()
     assert ws_common == repo_common
     listed = subprocess.run(
@@ -662,8 +666,15 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     ).stdout
-    assert f"worktree {target}" in listed
+    listed_worktrees = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in listed.splitlines()
+        if line.startswith("worktree ")
+    }
+    assert target.resolve() in listed_worktrees
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1253,6 +1264,7 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(kb, "_safe_which_no_cwd", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
@@ -1273,9 +1285,18 @@ def test_resolve_hermes_argv_module_actually_runs():
 
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
-        with mock.patch.object(shutil, "which", return_value=None):
+        with mock.patch.object(shutil, "which", return_value=None), mock.patch.object(
+            kb, "_safe_which_no_cwd", return_value=None
+        ):
             argv = kb._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    r = subprocess.run(
+        argv + ["--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"

@@ -6853,9 +6853,9 @@ class DispatchResult:
 # ``detect_crashed_workers`` to classify a dead-pid task.
 #
 # Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``. We keep raw status
-# so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
-# be consulted. Entries are trimmed by age (and total size cap as a
-# belt-and-braces against unbounded growth on exotic platforms).
+# so ``os.waitstatus_to_exitcode`` can classify normal exits and signals
+# portably. Entries are trimmed by age (and total size cap as a belt-and-
+# braces against unbounded growth on exotic platforms).
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
@@ -6889,17 +6889,17 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
     Returns ``(kind, code)`` where ``kind`` is one of:
 
-    * ``"clean_exit"`` — ``WIFEXITED`` with ``WEXITSTATUS == 0``. When the
+    * ``"clean_exit"`` — a normal process exit with status 0. When the
       task is still ``running`` in the DB, this is a protocol violation
       (worker exited without calling ``kanban_complete`` / ``kanban_block``)
       and should be auto-blocked immediately — retrying will just loop.
-    * ``"rate_limited"`` — ``WIFEXITED`` with status
+    * ``"rate_limited"`` — a normal process exit with status
       ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
-    * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
-    * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
+    * ``"nonzero_exit"`` — a normal process exit with non-zero status. Real error.
+    * ``"signaled"`` — process termination by signal (OOM killer, SIGKILL, etc).
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
       something else, or died between reap tick and liveness check). Fall
       back to existing crashed-counter behavior.
@@ -6913,18 +6913,16 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("unknown", None)
     raw, _ = entry
     try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
-    except Exception:
-        pass
-    return ("unknown", None)
+        return_code = os.waitstatus_to_exitcode(raw)
+    except (AttributeError, ValueError):
+        return ("unknown", None)
+    if return_code < 0:
+        return ("signaled", -return_code)
+    if return_code == 0:
+        return ("clean_exit", 0)
+    if return_code == KANBAN_RATE_LIMIT_EXIT_CODE:
+        return ("rate_limited", return_code)
+    return ("nonzero_exit", return_code)
 
 
 def reap_worker_zombies() -> "list[int]":
