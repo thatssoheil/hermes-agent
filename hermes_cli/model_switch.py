@@ -3949,8 +3949,30 @@ def list_authenticated_providers(
             else:
                 from hermes_cli.models import cached_fetch_api_models
 
+                # Resolve the bare-custom endpoint's key from config exactly as
+                # the runtime does: the ("api_key", "api") loop over model config
+                # (runtime_provider.py, bare-custom candidates list). An empty
+                # key makes authenticated endpoints reject the probe with 401 and
+                # the picker silently collapses to [current_model] (#83837).
+                # load_config_readonly fails open on parse errors, so only
+                # IO/type/attr errors are realistic here; any of them degrades to
+                # a keyless probe rather than abandoning the picker row.
+                _api_key = ""
+                try:
+                    from hermes_cli.config import load_config_readonly
+
+                    _model_cfg = load_config_readonly().get("model", {})
+                    if isinstance(_model_cfg, dict):
+                        for _k in ("api_key", "api"):
+                            _v = _model_cfg.get(_k)
+                            if isinstance(_v, str) and _v.strip():
+                                _api_key = _v.strip()
+                                break
+                except (OSError, TypeError, KeyError, AttributeError):
+                    _api_key = ""
+
                 _live_models = cached_fetch_api_models(
-                    "",
+                    _api_key,
                     str(current_base_url).strip().rstrip("/"),
                     cache_only=True,
                     timeout=(1.5 if for_picker else 5.0),
