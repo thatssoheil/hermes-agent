@@ -9,7 +9,7 @@ import logging
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_errors import is_malformed_db_error
@@ -439,6 +439,69 @@ class SessionSearchMixin:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
 
+    def _fts_inter_chunk_pause(self, chunk_started: float) -> None:
+        """Sleep at least the FTS duty-cycle floor after one chunk (shared by optimize and the
+        opportunistic drain): back-to-back BEGIN IMMEDIATE chunks starve a live gateway/CLI out
+        of its lock retries, so the pause is the single place that policy is enforced."""
+        time.sleep(max(self._FTS_REBUILD_MIN_PAUSE,
+                       (time.monotonic() - chunk_started) * self._FTS_REBUILD_DUTY_FACTOR))
+
+    # Opportunistic drain of demoted v22 FTS trash (issue #141131): `_fts_teardown_trash_step`
+    # runs only inside optimize_fts_storage, so an interrupted optimize leaves its shadow
+    # tables in state.db forever and `_optimize_settle` keeps refusing the layout stamp.
+    # Maintenance ticks drain a bounded slice instead of waiting for an exclusive window.
+    _FTS_TRASH_DRAIN_MAX_STEPS = 16          # chunks per maintenance tick
+    _FTS_TRASH_DRAIN_TIME_BUDGET_S = 2.0     # wall clock per maintenance tick
+
+    def drain_fts_trash_opportunistically(
+        self, *, max_steps: Optional[int] = None, time_budget: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Drain a bounded slice of demoted v22 FTS trash, settling once the last chunk lands.
+
+        ``optimize_fts_storage`` is the only drainer of ``fts_v22_trash_*`` and it needs an
+        uninterrupted exclusive window; a run killed after the demote step leaves dead pages
+        nothing else touches, and ``_optimize_settle`` keeps refusing ``teardown_incomplete``
+        so the layout stamp never lands (#141131). Periodic maintenance calls this instead: a
+        few chunks per tick, the same duty-cycle pause ``_drive`` uses, then the normal settle
+        path (without VACUUM) once the trash is gone. The high-water marker keeps every slice
+        resumable and cross-process safe, so concurrent openers only split the work.
+
+        Bounded by *max_steps* chunks and *time_budget* seconds so a large table cannot
+        monopolize a tick. Returns ``{"drained": <chunks>, "remaining": <bool>,
+        "settled": <bool>, "reason": <refusal|None>}``; never raises.
+        """
+        result: dict[str, Any] = {"drained": 0, "remaining": False, "settled": False, "reason": None}
+        if not self._fts_enabled or self.read_only:
+            return result
+        steps = self._FTS_TRASH_DRAIN_MAX_STEPS if max_steps is None else int(max_steps)
+        budget = self._FTS_TRASH_DRAIN_TIME_BUDGET_S if time_budget is None else float(time_budget)
+        try:
+            with self._read_ctx() as conn:
+                if not self._has_fts_trash(conn):
+                    return result  # nothing to drain: one read, no write
+            started = time.monotonic()
+            while result["drained"] < steps and time.monotonic() - started < budget:
+                _t0 = time.monotonic()
+                if not self._fts_teardown_trash_step():
+                    break
+                result["drained"] += 1
+                self._fts_inter_chunk_pause(_t0)
+            with self._read_ctx() as conn:
+                result["remaining"] = self._has_fts_trash(conn)
+            if not result["remaining"]:
+                # The demote already put the v23 tables in place, so a trash-free store is a
+                # complete layout: settle it exactly like optimize does, minus the VACUUM.
+                result["reason"] = self._execute_write(self._optimize_settle)
+                result["settled"] = result["reason"] is None
+                if result["settled"]:
+                    logger.info("Drained the interrupted FTS optimize trash in %s; layout settled.", self.db_path)
+                else:
+                    logger.debug("FTS trash drained but the layout did not settle: %s", result["reason"])
+        except Exception:
+            logger.warning("Opportunistic FTS trash drain failed; will retry on the next maintenance tick.",
+                           exc_info=True)
+        return result
+
     def _fts_cjk_reset_if_stale(self) -> None:
         """From-scratch rebuild of a stale cjk index (triggers were dropped, gap extent unknown):
         drop table + triggers, clear the breadcrumb, recreate (fresh backfill markers)."""
@@ -694,7 +757,7 @@ class SessionSearchMixin:
                 if not step():
                     break
                 _emit(phase)
-                time.sleep(max(self._FTS_REBUILD_MIN_PAUSE, (time.monotonic() - _t0) * self._FTS_REBUILD_DUTY_FACTOR))
+                self._fts_inter_chunk_pause(_t0)
 
         # Phase 1: base backfill; 1b: CJK-bigram backfill (own marker pair).
         _emit("backfill")

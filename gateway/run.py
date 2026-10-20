@@ -2199,6 +2199,7 @@ from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin, _own_policy_envs
 from gateway.run_watchers import GatewaySessionWatchersMixin
+from gateway.run_housekeeping_fts import _housekeeping_deferred_fts_retry, _housekeeping_fts_trash_drain
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
@@ -4442,22 +4443,6 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
         release_or_close(_adb)
 
 
-def _housekeeping_deferred_fts_retry() -> None:
-    """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
-    and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
-    # Retry here, on the existing tick, against the shared instances this process already holds:
-    # non-blocking admission, no new thread, rate-limited inside SessionDB. No-op when nothing is stale (one
-    # attribute read per instance). See #100108.
-    from hermes_state_registry import borrow_live_shared_session_dbs
-    with borrow_live_shared_session_dbs() as _session_dbs:
-        for _sdb in _session_dbs:
-            _retry = getattr(_sdb, "retry_deferred_fts_recovery", None)
-            if callable(_retry) and _retry():
-                logger.info(
-                    "Deferred state.db FTS rebuild completed in-process for %s; full-text search restored.",
-                    getattr(_sdb, "db_path", "state.db"))
-
-
 def _housekeeping_memory_trim() -> None:
     """Messaging-gateway counterpart to the TUI idle reaper; config-gated and rate-limited inside."""
     from hermes_cli.mem_trim import trim_memory
@@ -4543,6 +4528,7 @@ def _start_gateway_housekeeping(
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
         (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
+        (1, "FTS trash drain tick", _housekeeping_fts_trash_drain),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
