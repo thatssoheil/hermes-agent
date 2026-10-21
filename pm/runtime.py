@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +18,8 @@ import uuid
 
 from pm.filesystem import native
 from pm.package import InstallError
+
+LOG = logging.getLogger(__name__)
 
 
 def runtime_environment() -> dict[str, str]:
@@ -182,16 +185,21 @@ def lease_current_runtime() -> None:
         lease_directory(Path(sys.prefix))
 
 
-def collect_runtime_generations(root: Path) -> list[Path]:
+def collect_runtime_generations(root: Path, *, retained: list[tuple[Path, str]] | None = None) -> list[Path]:
     """Remove PM runtime generations nothing can run from any more.
 
     Staging happens under ``.prepare.lock``, so with it held an unpublished generation
     (no ``pm-runtime.json``) is an aborted stage. A superseded published generation goes
     once every worker launched from it has exited; generations published before leases
-    existed stay, as the application collector keeps its own.
+    existed stay, as the application collector keeps its own. A published generation that
+    a config file pins or a live process still runs from is retained even without a lease
+    (``GenerationResidency``, #141448): leases follow the activating process, not its
+    children. ``retained`` collects the (generation, reason) pairs for the caller's report.
+    Known limitation: a child spawned between the probe and the ``rmtree`` is not protected;
+    that window closes only when children take a lease at their own boot.
     """
     from pm.filesystem import lock_fd
-    from hermes_cli.runtime_state import leases_held
+    from hermes_cli.runtime_state import GenerationResidency, leases_held
 
     generations = root / "generations"
     removed: list[Path] = []
@@ -204,16 +212,22 @@ def collect_runtime_generations(root: Path) -> list[Path]:
             selected = json.loads((root / "selected.json").read_text(encoding="utf-8-sig")).get("generation", "")
         except FileNotFoundError:
             selected = ""
+        probe = GenerationResidency()
         for generation in sorted(generations.iterdir()):
             if not generation.is_dir() or generation.is_symlink() or generation == root / selected:
                 continue
             published = (generation / "pm-runtime.json").is_file()
             if published and (not (generation / ".lease-managed").is_file() or leases_held(generation)):
                 continue
+            reason = probe.reason(generation) if published else None
+            if reason:
+                LOG.info("retaining runtime generation %s: %s", generation, reason)
+                if retained is not None:
+                    retained.append((generation, reason))
+                continue
             shutil.rmtree(generation)
             removed.append(generation)
     return removed
-
 
 
 def runtime_python(*, bootstrap: bool = True, cache: Path | None = None) -> Path:
