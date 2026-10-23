@@ -340,6 +340,45 @@ def _tree_matches_completed_stamp(root: Path) -> bool:
     return info.commit == commit and not info.dirty
 
 
+def refresh_sealed_selection(project_root: Path) -> str | None:
+    """Re-resolve a sealed payload's recorded dependency selection before activation (#142998).
+
+    A packaged installer updates in place, so the payload lands at the same path and the
+    path-derived install key -- with the ``facts.json`` that names a generation -- survives
+    the swap. ``selected_venv`` and the ``committed_venv`` boot selection then keep answering
+    with the generation resolved against the previous release's lock, and nothing else
+    re-resolves it: a desktop updater never runs ``hermes update``, so the post-update
+    dependency step never runs either, and ``check_runtime`` only reports. Do the Docker
+    stage-2 step here, before activation: a current record is a no-op, a stale one is rebuilt
+    against this payload's lock, and a rebuild that cannot finish (offline) drops the recorded
+    environment so this boot uses the payload's own venv while the recorded extras stay for
+    the next attempt.
+
+    Returns what happened, or ``None`` when this tree is not a sealed payload or records no
+    selection (nothing to re-resolve).
+    """
+    import sys
+
+    from pm.environments import payload_venv, runtime_facts_path
+
+    root = Path(project_root).resolve()
+    if payload_venv(root) is None or not runtime_facts_path(root).is_file():
+        return None
+    from pm.recovery import refresh_dependencies
+
+    try:
+        outcome = refresh_dependencies(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        # Boot boundary: the expected failures here (a root mismatch, an unreadable or
+        # invalid record, a sync that could not run) must never keep the app from starting.
+        # Anything else is a real defect and reaches hermes_bootstrap's own boundary.
+        print(f"hermes: dependency environment refresh skipped: {exc}", file=sys.stderr, flush=True)
+        return None
+    if outcome not in ("base", "current"):
+        print(f"hermes: dependency environment: {outcome}", file=sys.stderr, flush=True)
+    return outcome
+
+
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
@@ -351,6 +390,9 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     A supervised child leaves that tail to ``hermes update`` when its dependencies
     are current: its manager restarts it on every start, so a sticky marker would
     re-run the tail (and its environment builds) on each boot until the disk fills.
+    A sealed payload has no checkout to update, but a packaged updater replaces the
+    tree under a surviving install key -- ``refresh_sealed_selection`` re-resolves
+    that record before activation rather than relaunching.
     Return the store interpreter when this process must restart cleanly.
     """
     import os
@@ -372,9 +414,14 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
             # leaves the user without the fence diagnosis or a usable restart remedy.
             or _is_read_only_gateway_status(command)
             or os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").lower() in ("1", "true", "yes")
-            or not (root / ".git").exists()
             or not (root / "pyproject.toml").is_file()):
         return None
+    if not (root / ".git").exists():
+        # A sealed payload has no checkout to update, but a packaged updater replaces the
+        # tree under a surviving install key: re-resolve the selection that swap invalidated
+        # in THIS process, before activation reads it (#142998).
+        refresh_sealed_selection(root)
+        return None  # Packaged runtimes retain their owner.
     stamp = read_install_stamp(root)
     if not stamp:
         from hermes_cli.post_update import step_adopt_blessed_checkout
